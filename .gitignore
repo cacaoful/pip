@@ -105,6 +105,7 @@ context.md
 
 # IDE
 .claude/
+.cursor/
 *.swp
 *~
 .vercel
