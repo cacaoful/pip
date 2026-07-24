@@ -68,7 +68,7 @@ while IFS= read -r file; do
       site_or_metadata=true
       ;;
 
-    AGENTS.md|CLAUDE.md|CONTRIBUTING.md|REVIEW.md|.openhands/*)
+    AGENTS.md|CLAUDE.md|CONTRIBUTING.md|REVIEW.md)
       repo_policy=true
       ;;
 
