@@ -85,7 +85,6 @@ dist-notary/
 dist-preprod/
 dist-release/
 scripts/notarize_dmg.sh
-scripts/dev-test.sh
 
 # Legacy files (kept locally, not tracked)
 CLAUDE.md

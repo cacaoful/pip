@@ -1,0 +1,257 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Builds and launches an isolated personal app for end-to-end testing.
+#
+# - Separate bundle ID (com.pip.app / com.pip.*) — won't collide with other installs
+# - Separate data directory (~/Library/Application Support/Pip*)
+# - Preserves existing config and database by default
+# - Builds default to local-only entitlements to preserve existing TCC
+#   permissions and avoid requiring Apple Developer profiles
+# - CloudKit/APNs signing is opt-in with --cloud-entitlements
+# - External contributors can set MUESLI_SKIP_SIGN=1 to build without the
+#   maintainer signing certificate
+# - Uses a shared, worktree-isolated SwiftPM scratch path by default; set
+#   MUESLI_DISABLE_SWIFTPM_SCRATCH_PATH=1 to use package-local .build instead
+# - Installs to /Applications/Pip.app (or PipA/B/C for lanes)
+#
+# Usage:
+#   ./scripts/dev-test.sh                         # Build and launch Pip
+#   ./scripts/dev-test.sh --lane A                # Build and launch PipA
+#   ./scripts/dev-test.sh --lane A --local-only   # Omit iCloud/APNs entitlements
+#   ./scripts/dev-test.sh --reset                 # Reset onboarding only (keeps data)
+#   MUESLI_PROVISIONING_PROFILE=/path/to/profile.provisionprofile \
+#   MUESLI_SIGN_IDENTITY="Apple Development: Name (TEAMID)" \
+#   MUESLI_CODESIGN_TIMESTAMP=none ./scripts/dev-test.sh --cloud-entitlements
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+usage() {
+  cat <<'EOF'
+Build and launch Pip.
+
+Options:
+  --lane A|B|C            Build a fixed reusable lane: PipA/B/C.
+  --local-only            Sign without iCloud/APNs entitlements.
+                          Alias: --without-cloud-entitlements.
+  --cloud-entitlements    Sign with the default cloud entitlements file.
+                          Alias: --with-cloud-entitlements.
+  --reset                 Reset onboarding only for the selected lane.
+  --help                  Show this help text.
+
+Default behavior without --lane: Pip, com.pip.app,
+~/Library/Application Support/Pip, and /Applications/Pip.app.
+Builds use local-only entitlements unless --cloud-entitlements is provided.
+
+Cloud-entitled builds require a provisioning profile whose app identifier
+matches the selected bundle ID and a signing identity included by that profile.
+For the plain Pip lane, this script auto-selects the local
+com.pip.app CloudKit profile from ../muesli-ios/secrets when
+--cloud-entitlements is provided and the profile exists.
+EOF
+}
+
+# Parse args
+RESET=0
+LANE=""
+ENTITLEMENTS_MODE=""
+ENTITLEMENTS_MODE_EXPLICIT=0
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --clean)
+      echo "Error: --clean has been removed because it deletes Pip data." >&2
+      echo "To test a fresh profile, create a named backup first and use a separate support directory." >&2
+      exit 2
+      ;;
+    --reset)
+      RESET=1
+      shift
+      ;;
+    --lane)
+      [[ $# -ge 2 ]] || { echo "Error: --lane requires A, B, or C." >&2; exit 2; }
+      LANE="$2"
+      shift 2
+      ;;
+    --lane=*)
+      LANE="${1#--lane=}"
+      shift
+      ;;
+    --local-only|--without-cloud-entitlements)
+      ENTITLEMENTS_MODE="local-only"
+      ENTITLEMENTS_MODE_EXPLICIT=1
+      shift
+      ;;
+    --cloud-entitlements|--with-cloud-entitlements)
+      ENTITLEMENTS_MODE="cloud"
+      ENTITLEMENTS_MODE_EXPLICIT=1
+      shift
+      ;;
+    --help|-h)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "Unknown argument: $1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
+
+case "$LANE" in
+  "")
+    DEV_APP_NAME="Pip"
+    DEV_BUNDLE_ID="com.pip.app"
+    ;;
+  A|a|B|b|C|c)
+    LANE_UPPER="$(printf '%s' "$LANE" | tr '[:lower:]' '[:upper:]')"
+    LANE_LOWER="$(printf '%s' "$LANE" | tr '[:upper:]' '[:lower:]')"
+    DEV_APP_NAME="Pip${LANE_UPPER}"
+    DEV_BUNDLE_ID="com.pip.${LANE_LOWER}"
+    ;;
+  *)
+    echo "Error: unsupported lane '$LANE'. Allowed lanes: A, B, C." >&2
+    exit 2
+    ;;
+esac
+
+if [[ -z "$ENTITLEMENTS_MODE" ]]; then
+  ENTITLEMENTS_MODE="local-only"
+fi
+
+DEV_SUPPORT_DIR="$HOME/Library/Application Support/$DEV_APP_NAME"
+DEV_APP="/Applications/$DEV_APP_NAME.app"
+ONBOARDING_PROGRESS_FILE="$DEV_SUPPORT_DIR/onboarding-progress.json"
+DEFAULT_DEV_CLOUD_PROFILE="$ROOT/../muesli-ios/secrets/mueslimacosdevcloudkitcommueslidev.provisionprofile"
+DEFAULT_DEV_CLOUD_SIGN_IDENTITY="Apple Development: Pranav Hari Guruvayurappan (59WTZW55XG)"
+RESOLVED_PROVISIONING_PROFILE="${MUESLI_PROVISIONING_PROFILE:-}"
+RESOLVED_SIGN_IDENTITY="${MUESLI_SIGN_IDENTITY:-}"
+RESOLVED_CODESIGN_TIMESTAMP="${MUESLI_CODESIGN_TIMESTAMP:-}"
+BUILD_ENV=(
+  MUESLI_APP_NAME="$DEV_APP_NAME"
+  MUESLI_BUNDLE_ID="$DEV_BUNDLE_ID"
+  MUESLI_SUPPORT_DIR_NAME="$DEV_APP_NAME"
+  MUESLI_DISPLAY_NAME="Pip"
+  MUESLI_EXECUTABLE_NAME="$DEV_APP_NAME"
+  MUESLI_SPARKLE_FEED_URL=""
+)
+
+use_local_only_entitlements() {
+  RESOLVED_PROVISIONING_PROFILE=""
+  RESOLVED_SIGN_IDENTITY=""
+  RESOLVED_CODESIGN_TIMESTAMP=""
+  # Friend/local builds should not require the upstream Developer ID cert.
+  # Ad-hoc sign by default; optionally keep grants across rebuilds with:
+  #   MUESLI_SKIP_SIGN=1 MUESLI_SIGN_IDENTITY="Apple Development: You (TEAMID)" ./scripts/dev-test.sh
+  if [[ -z "${MUESLI_SKIP_SIGN:-}" ]]; then
+    MUESLI_SKIP_SIGN=1
+  fi
+  BUILD_ENV+=(
+    MUESLI_ENTITLEMENTS="$ROOT/scripts/MuesliLocalOnly.entitlements"
+    MUESLI_PROVISIONING_PROFILE=""
+    MUESLI_APS_ENVIRONMENT=""
+    MUESLI_SKIP_SIGN="$MUESLI_SKIP_SIGN"
+  )
+  if [[ -n "${MUESLI_SIGN_IDENTITY:-}" ]]; then
+    BUILD_ENV+=(MUESLI_SIGN_IDENTITY="$MUESLI_SIGN_IDENTITY")
+  fi
+}
+
+case "$ENTITLEMENTS_MODE" in
+  local-only)
+    use_local_only_entitlements
+    ;;
+  cloud)
+    if [[ -z "$RESOLVED_PROVISIONING_PROFILE" && "$DEV_BUNDLE_ID" == "com.pip.app" && -f "$DEFAULT_DEV_CLOUD_PROFILE" ]]; then
+      RESOLVED_PROVISIONING_PROFILE="$DEFAULT_DEV_CLOUD_PROFILE"
+      if [[ -z "$RESOLVED_SIGN_IDENTITY" ]]; then
+        RESOLVED_SIGN_IDENTITY="$DEFAULT_DEV_CLOUD_SIGN_IDENTITY"
+      fi
+      if [[ -z "$RESOLVED_CODESIGN_TIMESTAMP" ]]; then
+        RESOLVED_CODESIGN_TIMESTAMP="none"
+      fi
+    fi
+    if [[ -z "$RESOLVED_PROVISIONING_PROFILE" ]]; then
+      if [[ "$ENTITLEMENTS_MODE_EXPLICIT" -eq 1 ]]; then
+        echo "Error: cloud-entitled dev builds require MUESLI_PROVISIONING_PROFILE." >&2
+        echo "The profile must match bundle ID '$DEV_BUNDLE_ID' and include the signing identity." >&2
+        echo "Use --local-only for a dev build that does not need iCloud/APNs entitlements." >&2
+        exit 2
+      fi
+      echo "No local CloudKit profile found for $DEV_BUNDLE_ID; building local-only dev app."
+      ENTITLEMENTS_MODE="local-only"
+      use_local_only_entitlements
+    else
+      if [[ -z "$RESOLVED_SIGN_IDENTITY" ]]; then
+        echo "Error: cloud-entitled dev builds require MUESLI_SIGN_IDENTITY." >&2
+        echo "Use the Apple Development identity included by the selected provisioning profile." >&2
+        exit 2
+      fi
+      BUILD_ENV+=(
+        MUESLI_PROVISIONING_PROFILE="$RESOLVED_PROVISIONING_PROFILE"
+        MUESLI_SIGN_IDENTITY="$RESOLVED_SIGN_IDENTITY"
+      )
+      if [[ -n "$RESOLVED_CODESIGN_TIMESTAMP" ]]; then
+        BUILD_ENV+=(MUESLI_CODESIGN_TIMESTAMP="$RESOLVED_CODESIGN_TIMESTAMP")
+      fi
+    fi
+    ;;
+  *)
+    echo "Error: internal unsupported entitlements mode '$ENTITLEMENTS_MODE'." >&2
+    exit 2
+    ;;
+esac
+
+# Kill any running dev instance
+pkill -f "$DEV_APP" 2>/dev/null || true
+sleep 0.5
+
+# Reset onboarding only if requested
+if [[ "$RESET" -eq 1 ]] && [[ -f "$DEV_SUPPORT_DIR/config.json" ]]; then
+  echo "Resetting onboarding flag for $DEV_APP_NAME..."
+  python3 -c "
+import json, os, pathlib
+p = pathlib.Path('$DEV_SUPPORT_DIR/config.json')
+c = json.loads(p.read_text())
+c['has_completed_onboarding'] = False
+mode = p.stat().st_mode & 0o777
+p.write_text(json.dumps(c, indent=2) + '\n')
+os.chmod(p, mode)
+progress = pathlib.Path('$ONBOARDING_PROGRESS_FILE')
+if progress.exists():
+    progress.unlink()
+    print('  Cleared transient onboarding progress')
+print('  Onboarding reset (data preserved)')
+"
+fi
+
+# Build with isolated identity
+echo "Building $DEV_APP_NAME (debug, signed)..."
+echo "  Bundle ID:    $DEV_BUNDLE_ID"
+echo "  Data:         $DEV_SUPPORT_DIR"
+echo "  Entitlements: $ENTITLEMENTS_MODE"
+if [[ -n "$RESOLVED_PROVISIONING_PROFILE" ]]; then
+  echo "  Profile:      $RESOLVED_PROVISIONING_PROFILE"
+fi
+if [[ -n "$RESOLVED_SIGN_IDENTITY" ]]; then
+  echo "  Sign identity: $RESOLVED_SIGN_IDENTITY"
+fi
+env "${BUILD_ENV[@]}" "$ROOT/scripts/build_native_app.sh" debug
+
+echo ""
+echo "Launching $DEV_APP_NAME..."
+open "$DEV_APP"
+
+echo ""
+echo "=== Dev Test Ready ==="
+echo "  App: $DEV_APP"
+echo "  Data: $DEV_SUPPORT_DIR"
+echo "  DB: $DEV_SUPPORT_DIR/muesli.db"
+echo ""
+echo "Tips:"
+if [[ -n "$LANE" ]]; then
+  echo "  ./scripts/dev-test.sh --lane $LANE --reset    # Re-run onboarding for this lane (keep data)"
+else
+  echo "  ./scripts/dev-test.sh --reset                 # Re-run onboarding (keep data)"
+fi
+echo "  pkill -f \"$DEV_APP\"                         # Kill this dev app"
