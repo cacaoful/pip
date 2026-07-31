@@ -1915,6 +1915,61 @@ struct HotkeyMonitorTests {
         #expect(!monitor.isToggleRecording)
         #expect(toggleStopCount == 1)
     }
+
+    @Test("whisper style deferred tap lock wins over fn release race")
+    @MainActor
+    func whisperStyleDeferredTapLockWinsOverFnReleaseRace() {
+        let scheduler = ManualHotkeyScheduler()
+        let monitor = scheduler.makeMonitor(prepareDelay: 0, startDelay: 0.05)
+        monitor.configure(keyCode: 63)
+
+        var stopCount = 0
+        var toggleStartCount = 0
+        monitor.onStop = { stopCount += 1 }
+        monitor.onToggleStart = { toggleStartCount += 1 }
+
+        monitor.handleFlagsChanged(keyCode: 63, flags: .function)
+        scheduler.advance(by: 0.05)
+        #expect(!monitor.isToggleRecording)
+
+        // Space tap commits immediately but defers enter (off-main path).
+        monitor.scheduleWhisperHandsFreeFromTapForTests()
+
+        // Fn release arrives before the deferred enter runs.
+        monitor.handleFlagsChanged(keyCode: 63, flags: [])
+
+        #expect(monitor.isToggleRecording)
+        #expect(stopCount == 0)
+        #expect(toggleStartCount == 0) // hold session kept; no new toggle start
+
+        scheduler.advance(by: 0)
+        #expect(monitor.isToggleRecording)
+        #expect(stopCount == 0)
+    }
+
+    @Test("whisper style globe synthetic keydown does not cancel hold")
+    @MainActor
+    func whisperStyleGlobeSyntheticKeyDownDoesNotCancelHold() {
+        let scheduler = ManualHotkeyScheduler()
+        let monitor = scheduler.makeMonitor(prepareDelay: 0, startDelay: 0.05)
+        monitor.configure(keyCode: 63)
+
+        var stopCount = 0
+        var cancelCount = 0
+        monitor.onStop = { stopCount += 1 }
+        monitor.onCancel = { cancelCount += 1 }
+
+        monitor.handleFlagsChanged(keyCode: 63, flags: .function)
+        scheduler.advance(by: 0.05)
+
+        let consumed = monitor.handleKeyDown(keyCode: 179, flags: .function)
+        #expect(!consumed)
+        #expect(stopCount == 0)
+        #expect(cancelCount == 0)
+
+        monitor.handleFlagsChanged(keyCode: 63, flags: [])
+        #expect(stopCount == 1)
+    }
 }
 
 @Suite("MeetingResummarizationPolicy")

@@ -39,6 +39,8 @@ final class HotkeyMonitor {
     private(set) var whisperStyleEnabled: Bool = false
     private let whisperFnKeyCode: UInt16 = 63
     private let whisperSpaceKeyCode: UInt16 = 49
+    /// Synthetic Globe keyDown macOS may emit around Fn use.
+    private let whisperGlobeKeyCode: UInt16 = 179
 
     // Combination mode (e.g. Cmd+Shift+R)
     var combinationModifiers: NSEvent.ModifierFlags?
@@ -69,6 +71,12 @@ final class HotkeyMonitor {
     private var lastTapUpTime: Date?
     private var lastTapWasShort = false
     private var toggleActive = false
+
+    /// Set synchronously when the Space event-tap consumes Fn+Space, before the
+    /// main-queue hop that finishes locking. Fn-up must honor this so hold-stop
+    /// cannot win the race against hands-free lock.
+    private let whisperCommitLock = NSLock()
+    private var whisperHandsFreeCommit = false
 
     private var prepareDelay: TimeInterval
     private var startDelay: TimeInterval
@@ -158,6 +166,7 @@ final class HotkeyMonitor {
         combinationKeyDown = false
         combinationTriggered = false
         suppressedWhisperSpace = false
+        clearWhisperHandsFreeCommit()
     }
 
     func configure(keyCode: UInt16) {
@@ -469,6 +478,10 @@ final class HotkeyMonitor {
                 }
             } else {
                 fputs("[hotkey] target key \(targetKeyCode) up\n", stderr)
+                // Event-tap Space lock may still be queued on main. Commit it
+                // before hold-release stop logic can finalize the session.
+                flushWhisperHandsFreeCommitIfNeeded()
+
                 let wasDown = targetKeyDown
                 let wasArmed = armed
                 targetKeyDown = false
@@ -579,6 +592,12 @@ final class HotkeyMonitor {
             return true
         }
 
+        // Globe emits a synthetic keyDown (179) around Fn; never treat it as
+        // "other key" cancellation for hold-to-talk.
+        if keyCode == whisperGlobeKeyCode {
+            return false
+        }
+
         if targetKeyDown && !toggleActive {
             if keyCode != targetKeyCode {
                 fputs("[hotkey] canceled by other key\n", stderr)
@@ -616,8 +635,31 @@ final class HotkeyMonitor {
             && fnHeld
     }
 
+    private func markWhisperHandsFreeCommit() {
+        whisperCommitLock.lock()
+        whisperHandsFreeCommit = true
+        whisperCommitLock.unlock()
+    }
+
+    private func clearWhisperHandsFreeCommit() {
+        whisperCommitLock.lock()
+        whisperHandsFreeCommit = false
+        whisperCommitLock.unlock()
+    }
+
+    @discardableResult
+    private func flushWhisperHandsFreeCommitIfNeeded() -> Bool {
+        whisperCommitLock.lock()
+        let pending = whisperHandsFreeCommit
+        whisperCommitLock.unlock()
+        guard pending else { return false }
+        enterWhisperHandsFreeFromChord()
+        return true
+    }
+
     /// Convert an in-progress Fn hold into locked hands-free dictation.
     private func enterWhisperHandsFreeFromChord() {
+        clearWhisperHandsFreeCommit()
         guard whisperStyleEnabled, !toggleActive else { return }
         fputs("[hotkey] whisper fn+Space → hands-free\n", stderr)
         lastTapWasShort = false
@@ -638,6 +680,22 @@ final class HotkeyMonitor {
 
         toggleActive = true
         onToggleStart?()
+    }
+
+    /// Schedule hands-free lock after the Space tap consumes the key.
+    /// Marks commit synchronously so Fn-up cannot stop the hold first.
+    private func scheduleWhisperHandsFreeFromTap() {
+        markWhisperHandsFreeCommit()
+        if Thread.isMainThread {
+            enterWhisperHandsFreeFromChord()
+            return
+        }
+        // Prefer the injectable scheduler so tests can interleave Fn-up before
+        // the hop runs; production default is DispatchQueue.main.asyncAfter.
+        let item = DispatchWorkItem { [weak self] in
+            self?.enterWhisperHandsFreeFromChord()
+        }
+        scheduleAfter(0, item)
     }
 
     private func startWhisperSpaceSuppressionTapIfNeeded() {
@@ -703,14 +761,9 @@ final class HotkeyMonitor {
            shouldConsumeWhisperSpace(keyCode: keyCode, fnHeld: fnHeld),
            event.getIntegerValueField(.keyboardEventAutorepeat) == 0 {
             suppressedWhisperSpace = true
-            // Tap runs off the main thread; hop back before mutating monitor state.
-            if Thread.isMainThread {
-                enterWhisperHandsFreeFromChord()
-            } else {
-                DispatchQueue.main.async { [weak self] in
-                    self?.enterWhisperHandsFreeFromChord()
-                }
-            }
+            // Commit synchronously, then hop to main for the rest of the lock.
+            // Without the commit, Fn-up can call onStop before toggleActive flips.
+            scheduleWhisperHandsFreeFromTap()
             return nil
         }
 
@@ -799,6 +852,15 @@ final class HotkeyMonitor {
     func setHoldRecordingActiveForTests() {
         targetKeyDown = true
         active = true
+    }
+
+    /// Simulates the off-main event-tap path: commit now, defer enter via scheduler.
+    func scheduleWhisperHandsFreeFromTapForTests() {
+        markWhisperHandsFreeCommit()
+        let item = DispatchWorkItem { [weak self] in
+            self?.enterWhisperHandsFreeFromChord()
+        }
+        scheduleAfter(0, item)
     }
 
     func shouldHandleLocalEventForTests(
