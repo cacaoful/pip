@@ -106,6 +106,8 @@ final class FloatingIndicatorController: NSObject {
     private var computerUseTranscriptText: String?
     private var loadingSpinner: NSProgressIndicator?
     private var isShowingLoading = false
+    /// Sticky amber warning (e.g. secure input); dismissed on mouse-over.
+    private var isShowingBlockingWarning = false
     private var isComputerUseCursorMode = false
     private var computerUseCursorReturnFrame: NSRect?
 
@@ -272,6 +274,10 @@ final class FloatingIndicatorController: NSObject {
         let previousHover = isHovered
         if isComputerUseCursorMode {
             exitComputerUseCursorMode(restoreFrame: false)
+        }
+        // Dictation chrome takes over; sticky warnings wait until idle again.
+        if state != .idle {
+            isShowingBlockingWarning = false
         }
         self.state = state
         if state != .transcribing {
@@ -494,17 +500,65 @@ final class FloatingIndicatorController: NSObject {
 
     /// Flash a brief warning message on the indicator pill, then snap back to idle.
     func showWarning(_ message: String, icon: String = "⚡", duration: TimeInterval = 2.5) {
-        guard state == .idle else { return }
+        presentWarning(
+            message: message,
+            icon: icon,
+            duration: duration,
+            fontSize: 11,
+            iconFontSize: 14,
+            height: 36,
+            force: false
+        )
+    }
+
+    /// Larger sticky warning. Stays until the user mouses over the pill.
+    func showBlockingWarning(_ message: String, icon: String = "⚡") {
+        presentWarning(
+            message: message,
+            icon: icon,
+            duration: nil,
+            fontSize: 14,
+            iconFontSize: 18,
+            height: 48,
+            force: true,
+            dismissOnHover: true
+        )
+    }
+
+    private func presentWarning(
+        message: String,
+        icon: String,
+        duration: TimeInterval?,
+        fontSize: CGFloat,
+        iconFontSize: CGFloat,
+        height: CGFloat,
+        force: Bool,
+        dismissOnHover: Bool = false
+    ) {
+        if force {
+            // Drop preparing/recording chrome so this warning owns the panel.
+            state = .idle
+            isShowingLoading = false
+            loadingSpinner?.stopAnimation(nil)
+            loadingSpinner?.isHidden = true
+        } else {
+            guard state == .idle, !isShowingBlockingWarning else { return }
+        }
+
+        isShowingBlockingWarning = dismissOnHover
+
         let config = configStore.load()
         if panel == nil { createPanel(config: config) }
         guard let panel, let contentView, let iconLabel, let textLabel else { return }
         guard let screen = NSScreen.main?.visibleFrame else { return }
 
-        let warningFont = NSFont.systemFont(ofSize: 11, weight: .medium)
+        let warningFont = NSFont.systemFont(ofSize: fontSize, weight: .semibold)
         let warningSize = warningPillSize(
             message: message,
             icon: icon,
             font: warningFont,
+            iconFontSize: iconFontSize,
+            height: height,
             screen: screen
         )
         let center = CGPoint(x: panel.frame.midX, y: panel.frame.midY)
@@ -516,6 +570,7 @@ final class FloatingIndicatorController: NSObject {
         glassView?.isHidden = true
         tintLayer?.isHidden = true
         micIconView?.isHidden = true
+        wandIconView?.isHidden = true
 
         NSAnimationContext.runAnimationGroup { context in
             context.duration = 0.18
@@ -526,13 +581,13 @@ final class FloatingIndicatorController: NSObject {
             panel.animator().alphaValue = 1.0
             contentView.animator().frame = NSRect(origin: .zero, size: warningSize)
             contentView.layer?.cornerRadius = warningSize.height / 2
-            contentView.layer?.backgroundColor = NSColor.colorWith(hex: 0xD99A11, alpha: 0.92).cgColor
+            contentView.layer?.backgroundColor = NSColor.colorWith(hex: 0xD99A11, alpha: 0.96).cgColor
             contentView.layer?.borderWidth = 1.0
-            contentView.layer?.borderColor = NSColor.colorWith(hex: 0xFFFFFF, alpha: 0.24).cgColor
+            contentView.layer?.borderColor = NSColor.colorWith(hex: 0xFFFFFF, alpha: 0.28).cgColor
 
             let hasIcon = !icon.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             iconLabel.isHidden = !hasIcon
-            iconLabel.font = NSFont.systemFont(ofSize: 14, weight: .bold)
+            iconLabel.font = NSFont.systemFont(ofSize: iconFontSize, weight: .bold)
             iconLabel.stringValue = icon
             iconLabel.textColor = NSColor.colorWith(hex: 0x1A140D, alpha: 0.95)
             iconLabel.animator().alphaValue = hasIcon ? 1 : 0
@@ -546,24 +601,39 @@ final class FloatingIndicatorController: NSObject {
         }
         panel.orderFrontRegardless()
 
-        DispatchQueue.main.asyncAfter(deadline: .now() + duration) { [weak self] in
-            guard let self, self.state == .idle else { return }
-            self.setState(.idle, config: self.configStore.load())
+        if let duration {
+            DispatchQueue.main.asyncAfter(deadline: .now() + duration) { [weak self] in
+                guard let self, self.state == .idle, !self.isShowingBlockingWarning else { return }
+                self.setState(.idle, config: self.configStore.load())
+            }
         }
     }
 
-    private func warningPillSize(message: String, icon: String, font: NSFont, screen: NSRect) -> NSSize {
-        let horizontalPadding: CGFloat = 18
+    private func dismissBlockingWarning() {
+        guard isShowingBlockingWarning else { return }
+        isShowingBlockingWarning = false
+        setState(.idle, config: configStore.load())
+    }
+
+    private func warningPillSize(
+        message: String,
+        icon: String,
+        font: NSFont,
+        iconFontSize: CGFloat = 14,
+        height: CGFloat = 36,
+        screen: NSRect
+    ) -> NSSize {
+        let horizontalPadding: CGFloat = height >= 44 ? 22 : 18
         let hasIcon = !icon.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         let iconWidth = hasIcon
-            ? max(24, ceil((icon as NSString).size(withAttributes: [.font: NSFont.systemFont(ofSize: 14, weight: .bold)]).width) + 2)
+            ? max(28, ceil((icon as NSString).size(withAttributes: [.font: NSFont.systemFont(ofSize: iconFontSize, weight: .bold)]).width) + 2)
             : 0
-        let iconGap: CGFloat = hasIcon ? 4 : 0
+        let iconGap: CGFloat = hasIcon ? 8 : 0
         let textWidth = ceil((message as NSString).size(withAttributes: [.font: font]).width) + 2
         let preferredWidth = horizontalPadding + iconWidth + iconGap + textWidth + horizontalPadding
-        let minWidth: CGFloat = hasIcon ? 180 : 88
-        let maxWidth = max(minWidth, min(640, screen.width - 32))
-        return NSSize(width: min(max(preferredWidth, minWidth), maxWidth), height: 36)
+        let minWidth: CGFloat = hasIcon ? 240 : 120
+        let maxWidth = max(minWidth, min(720, screen.width - 32))
+        return NSSize(width: min(max(preferredWidth, minWidth), maxWidth), height: height)
     }
 
     func showLoading(_ message: String) {
@@ -671,7 +741,11 @@ final class FloatingIndicatorController: NSObject {
     }
 
     func setHovered(_ hovered: Bool) {
-        guard state == .idle, !isShowingLoading, !isDragging, isHovered != hovered else { return }
+        if hovered, isShowingBlockingWarning {
+            dismissBlockingWarning()
+            return
+        }
+        guard state == .idle, !isShowingLoading, !isShowingBlockingWarning, !isDragging, isHovered != hovered else { return }
         hoverExitWorkItem?.cancel()
         isHovered = hovered
         let config = configStore.load()
@@ -679,7 +753,7 @@ final class FloatingIndicatorController: NSObject {
     }
 
     func scheduleHoverExit() {
-        guard state == .idle, !isShowingLoading, isHovered else { return }
+        guard state == .idle, !isShowingLoading, !isShowingBlockingWarning, isHovered else { return }
         hoverExitWorkItem?.cancel()
         let workItem = DispatchWorkItem { [weak self] in
             guard let self else { return }
@@ -691,7 +765,7 @@ final class FloatingIndicatorController: NSObject {
     }
 
     func closeIfIdle() {
-        if state == .idle, !isShowingLoading { close() }
+        if state == .idle, !isShowingLoading, !isShowingBlockingWarning { close() }
     }
 
     func close() {

@@ -1522,6 +1522,29 @@ struct HotkeyMonitorTests {
         )
     }
 
+    @Test("local monitor allows whisper fn and space while editing text")
+    @MainActor
+    func localMonitorAllowsWhisperFnAndSpaceWhileEditingText() async throws {
+        let monitor = HotkeyMonitor()
+        monitor.configure(keyCode: 63)
+        let textView = NSTextView()
+
+        #expect(
+            monitor.shouldHandleLocalEventForTests(
+                type: .flagsChanged,
+                keyCode: 63,
+                firstResponder: textView
+            )
+        )
+        #expect(
+            monitor.shouldHandleLocalEventForTests(
+                type: .keyDown,
+                keyCode: 49,
+                firstResponder: textView
+            )
+        )
+    }
+
     @Test("local monitor preserves key-up cleanup after hotkey session is armed")
     @MainActor
     func localMonitorPreservesKeyUpCleanupAfterHotkeySessionIsArmed() async throws {
@@ -1969,6 +1992,87 @@ struct HotkeyMonitorTests {
 
         monitor.handleFlagsChanged(keyCode: 63, flags: [])
         #expect(stopCount == 1)
+    }
+}
+
+@Suite("SecureInput")
+struct SecureInputTests {
+
+    @Test("no holder means hotkeys are not blocked")
+    func noHolderMeansHotkeysAreNotBlocked() {
+        let status = SecureInputInspector.resolveStatus(
+            holderPID: nil,
+            ownPID: 100,
+            isRunning: { _ in true },
+            appName: { _ in nil }
+        )
+        #expect(status.holder == .none)
+        #expect(!status.blocksHotkeys)
+        #expect(status.indicatorMessage == nil)
+    }
+
+    @Test("our own secure field does not count as blocked")
+    func ownSecureFieldDoesNotCountAsBlocked() {
+        let status = SecureInputInspector.resolveStatus(
+            holderPID: 100,
+            ownPID: 100,
+            isRunning: { _ in true },
+            appName: { _ in "Pip" }
+        )
+        #expect(status.holder == .ownProcess)
+        #expect(!status.blocksHotkeys)
+    }
+
+    @Test("live holder is named in the warning")
+    func liveHolderIsNamedInTheWarning() {
+        let status = SecureInputInspector.resolveStatus(
+            holderPID: 1356,
+            ownPID: 100,
+            isRunning: { _ in true },
+            appName: { _ in "Google Chrome" }
+        )
+        #expect(status.holder == .otherApp(pid: 1356, name: "Google Chrome"))
+        #expect(status.blocksHotkeys)
+        #expect(status.indicatorMessage == "Fn+Space blocked by Google Chrome — leave its password field")
+    }
+
+    @Test("holder that exited is reported as a stuck lock")
+    func holderThatExitedIsReportedAsStuckLock() {
+        let status = SecureInputInspector.resolveStatus(
+            holderPID: 1356,
+            ownPID: 100,
+            isRunning: { _ in false },
+            appName: { _ in nil }
+        )
+        #expect(status.holder == .stale(pid: 1356))
+        #expect(status.blocksHotkeys)
+        #expect(status.indicatorMessage == "Fn+Space blocked — Apple menu → Log Out of Mac")
+        #expect(status.explanation?.contains("Log Out") == true)
+    }
+
+    @Test("throttle warns once per interval and again for a new holder")
+    func throttleWarnsOncePerIntervalAndAgainForNewHolder() {
+        let throttle = SecureInputWarningThrottle(interval: 300)
+        let start = Date()
+        let stuck = SecureInputStatus(holder: .stale(pid: 1356))
+
+        #expect(throttle.shouldWarn(for: stuck, now: start))
+        #expect(!throttle.shouldWarn(for: stuck, now: start.addingTimeInterval(299)))
+        #expect(throttle.shouldWarn(for: stuck, now: start.addingTimeInterval(301)))
+
+        let other = SecureInputStatus(holder: .otherApp(pid: 42, name: "Terminal"))
+        #expect(throttle.shouldWarn(for: other, now: start.addingTimeInterval(302)))
+    }
+
+    @Test("clearing the lock resets the throttle so the next block warns")
+    func clearingTheLockResetsTheThrottle() {
+        let throttle = SecureInputWarningThrottle(interval: 300)
+        let start = Date()
+        let stuck = SecureInputStatus(holder: .stale(pid: 1356))
+
+        #expect(throttle.shouldWarn(for: stuck, now: start))
+        #expect(!throttle.shouldWarn(for: SecureInputStatus(holder: .none), now: start))
+        #expect(throttle.shouldWarn(for: stuck, now: start.addingTimeInterval(1)))
     }
 }
 

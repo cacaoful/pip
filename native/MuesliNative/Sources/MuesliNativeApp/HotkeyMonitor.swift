@@ -25,6 +25,30 @@ enum HotkeyTriggerTiming {
 }
 
 final class HotkeyMonitor {
+    /// Opt-in key-event tracing for diagnosing hotkey delivery problems.
+    /// Writes to a file because GUI launches discard stderr.
+    static let debugEnabled = ProcessInfo.processInfo.environment["PIP_HOTKEY_DEBUG"] == "1"
+    private static let debugLogPath = ProcessInfo.processInfo.environment["PIP_HOTKEY_DEBUG_LOG"]
+        ?? "/tmp/pip-hotkey-dbg.log"
+    private static let debugLogQueue = DispatchQueue(label: "com.pip.hotkey-debug-log")
+
+    static func debugTrace(_ message: String) {
+        guard debugEnabled else { return }
+        let line = "\(Date().timeIntervalSince1970) \(message)\n"
+        fputs(line, stderr)
+        debugLogQueue.async {
+            guard let data = line.data(using: .utf8) else { return }
+            let url = URL(fileURLWithPath: debugLogPath)
+            if let handle = try? FileHandle(forWritingTo: url) {
+                defer { try? handle.close() }
+                _ = try? handle.seekToEnd()
+                try? handle.write(contentsOf: data)
+            } else {
+                try? data.write(to: url)
+            }
+        }
+    }
+
     var onArm: (() -> Void)?
     var onPrepare: (() -> Void)?
     var onStart: (() -> Void)?
@@ -124,6 +148,9 @@ final class HotkeyMonitor {
             let requested = CGRequestListenEventAccess()
             fputs("[hotkey] requested listen event access: \(requested)\n", stderr)
         }
+        HotkeyMonitor.debugTrace(
+            "start listenAccess=\(hasListenAccess) axTrusted=\(AXIsProcessTrusted()) pid=\(ProcessInfo.processInfo.processIdentifier)"
+        )
 
         globalMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.flagsChanged, .keyDown, .keyUp]) { [weak self] event in
             self?.handle(event)
@@ -280,6 +307,11 @@ final class HotkeyMonitor {
 
     @discardableResult
     private func handle(_ event: NSEvent) -> Bool {
+        if HotkeyMonitor.debugEnabled {
+            HotkeyMonitor.debugTrace(
+                "nsevent type=\(event.type.rawValue) keyCode=\(event.keyCode) fn=\(event.modifierFlags.contains(.function)) targetKeyDown=\(targetKeyDown) active=\(active) toggle=\(toggleActive)"
+            )
+        }
         if isCombinationMode {
             return handleCombination(event)
         }
@@ -422,12 +454,15 @@ final class HotkeyMonitor {
             return true
         }
 
-        // Allow consuming fn+Space even before hold state is tracked, so the
-        // space character never reaches an editor when Muesli is focused.
-        if whisperStyleEnabled,
-           type == .keyDown,
-           keyCode == whisperSpaceKeyCode {
-            return true
+        // Wispr-style needs Fn flags + Space even before hold state is tracked,
+        // including when Pip's own text fields are focused.
+        if whisperStyleEnabled {
+            if type == .flagsChanged, keyCode == targetKeyCode || keyCode == whisperFnKeyCode {
+                return true
+            }
+            if (type == .keyDown || type == .keyUp), keyCode == whisperSpaceKeyCode {
+                return true
+            }
         }
 
         return type == .keyDown && keyCode == 53
@@ -755,7 +790,14 @@ final class HotkeyMonitor {
         }
 
         let keyCode = UInt16(event.getIntegerValueField(.keyboardEventKeycode))
-        let fnHeld = event.flags.contains(.maskSecondaryFn) || targetKeyDown
+        let fnFlag = event.flags.contains(.maskSecondaryFn)
+        let fnHeld = fnFlag || targetKeyDown
+
+        if HotkeyMonitor.debugEnabled {
+            HotkeyMonitor.debugTrace(
+                "tap type=\(type.rawValue) keyCode=\(keyCode) fnFlag=\(fnFlag) targetKeyDown=\(targetKeyDown) active=\(active) toggle=\(toggleActive)"
+            )
+        }
 
         if type == .keyDown,
            shouldConsumeWhisperSpace(keyCode: keyCode, fnHeld: fnHeld),

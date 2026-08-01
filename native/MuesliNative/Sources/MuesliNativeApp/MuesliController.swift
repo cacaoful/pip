@@ -238,6 +238,8 @@ final class MuesliController: NSObject {
     private let launchAtLoginCoordinator: LaunchAtLoginCoordinator
     let transcriptionCoordinator = TranscriptionCoordinator()
     private let hotkeyMonitor = HotkeyMonitor()
+    private let secureInputWarningThrottle = SecureInputWarningThrottle()
+    private var pendingSecureInputWarning: String?
     private let computerUseHotkeyMonitor = HotkeyMonitor()
     private let meetingRecordingHotkeyMonitor = HotkeyMonitor()
     private let computerUseRecorder = MicrophoneRecorder()
@@ -5956,6 +5958,9 @@ final class MuesliController: NSObject {
             } else {
                 indicator.setState(state, config: config)
             }
+            if state == .idle {
+                presentPendingSecureInputWarningIfNeeded()
+            }
         }
     }
 
@@ -6769,7 +6774,30 @@ final class MuesliController: NSObject {
         }
     }
 
+    /// Fn still reaches us under secure input (it's a modifier), so hold-to-talk
+    /// keeps working. Queue a sticky warning about Fn+Space; show it when idle
+    /// so it isn't covered by the dictation pill.
+    private func queueSecureInputWarningIfNeeded() {
+        let status = SecureInputInspector.currentStatus()
+        guard status.blocksHotkeys,
+              let message = status.indicatorMessage,
+              secureInputWarningThrottle.shouldWarn(for: status) else { return }
+        if let explanation = status.explanation {
+            fputs("[muesli-native] secure input active: \(explanation)\n", stderr)
+        }
+        // Always defer until idle so hold-to-talk's preparing pill isn't covered.
+        pendingSecureInputWarning = message
+    }
+
+    private func presentPendingSecureInputWarningIfNeeded() {
+        guard let message = pendingSecureInputWarning else { return }
+        pendingSecureInputWarning = nil
+        indicator.showBlockingWarning(message, icon: "\u{1F512}")
+        statusBarController?.setStatus(message)
+    }
+
     private func handleArm() {
+        queueSecureInputWarningIfNeeded()
         if isMeetingRecording() { return }
         if blockDictationForMeetingActivityIfNeeded() { return }
         if dictationLatencyTraceID == nil {
